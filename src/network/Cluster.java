@@ -1,6 +1,5 @@
 package network;
 
-import java.io.Closeable;
 import java.io.IOException;
 import java.io.ObjectOutputStream;
 import java.io.UncheckedIOException;
@@ -12,143 +11,121 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.UnknownHostException;
 import java.util.Arrays;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import network.internal.PingSender;
-import network.internal.ServerThread;
+import network.internal.ServerSocketThread;
 
-public class Cluster implements Closeable {
+/**
+ * Cluster is the main class of the network lazer. Cluster must be instantiated to let two nodes
+ * talk to each other.
+ */
+public class Cluster {
 
-	private static final InetAddress GROUP;
+  private static final InetAddress GROUP;
 
-	private static final String MULTICAST_IP = "230.0.113.0";
+  /**
+   * The multicast IP address where the two nodes will start pinging each other.
+   */
+  public static final String MULTICAST_IP = "230.0.113.0";
 
-	public static final int MULTICAST_PORT = 4446;
+  /**
+   * The multicast port where the two nodes will start pinging each other.
+   */
+  public static final int MULTICAST_PORT = 4446;
 
-	static {
-		try {
-			GROUP = InetAddress.getByName(MULTICAST_IP);
-		} catch (UnknownHostException e) {
-			throw new RuntimeException(e);
-		}
-	}
+  static {
+    try {
+      GROUP = InetAddress.getByName(MULTICAST_IP);
+    } catch (UnknownHostException e) {
+      throw new RuntimeException(e);
+    }
+  }
 
-	private Socket clientSocket = null;
+  /**
+   * Connects to the cluster. This function returns only if
+   * <ul>
+   * <li>This node is connected to other node in a cluster and they can start talking.</li>
+   * <li>The thread that called this function is interrupted.
+   * <li>
+   * </ul>
+   * If programmers want to interrupt this function for a reason (e.g.: pushing a cancel button),
+   * this function should be called on a new thread and the thread should be interrupted in case of
+   * pushing the cancel button.
+   *
+   * @param objectReceiver
+   *          The programmer, who needs two nodes in a cluster, should implement ObjectReceiver. The
+   *          objects sent by the other nodes will be passed to
+   *          {@link ObjectReceiver#receive(Object)}.
+   * @param failureListener
+   *          In case a network failure occures during waiting for more objects, the {@link Cluster}
+   *          instance will call {@link FailureListener#fail(Throwable)} function. The programmer,
+   *          who needs the cluster should implement this interface and handle unexpected
+   *          exceptions.
+   * @return The {@link Cluster} instance. After this method is returned, the programmer should
+   *         {@link #send(Object)} to send objects to the other node in the cluster.
+   * @throws IOException
+   *           if there is any problem during connecting to the other node.
+   */
+  public synchronized ConnectedNode connect(final ObjectReceiver objectReceiver,
+      final FailureListener failureListener)
+      throws IOException {
+    ServerSocket serverSocket = new ServerSocket(0);
+    int serverPort = serverSocket.getLocalPort();
 
-	private AtomicBoolean closed = new AtomicBoolean(false);
+    byte[] serverPortBA = convertIntToByteArray(serverPort);
+    PingSender pingSender = new PingSender(GROUP, serverPortBA, failureListener);
 
-	private final FailureListener failureListener;
+    ServerSocketThread serverSocketThread =
+        new ServerSocketThread(serverSocket, objectReceiver,
+            failureListener, pingSender);
+    serverSocketThread.start();
 
-	private ObjectOutputStream objectOutputStream;
+    new Thread(pingSender).start();
 
-	private final ObjectReceiver objectReceiver;
+    InetSocketAddress remoteSocketAddress = waitForPing(serverPortBA);
 
-	private PingSender pingSender;
+    Socket clientSocket =
+        new Socket(remoteSocketAddress.getAddress(), remoteSocketAddress.getPort());
 
-	private ServerSocket serverSocket;
+    ObjectOutputStream objectOutputStream = new ObjectOutputStream(clientSocket.getOutputStream());
+    return new ConnectedNode(serverSocketThread, clientSocket, objectOutputStream);
+  }
 
-	private ServerThread serverThread;
+  private int convertByteArrayToInt(final byte[] bytes) {
+    return bytes[0] << 24 | (bytes[1] & 0xFF) << 16 | (bytes[2] & 0xFF) << 8 | (bytes[3] & 0xFF);
+  }
 
-	public Cluster(final ObjectReceiver objectReceiver, final FailureListener failureListener) {
-		super();
-		this.objectReceiver = objectReceiver;
-		this.failureListener = failureListener;
-	}
+  private byte[] convertIntToByteArray(final int data) {
+    byte[] result = new byte[Integer.BYTES];
 
-	@Override
-	public synchronized void close() throws IOException {
-		if (!closed.getAndSet(true)) {
-			if (pingSender != null) {
-				pingSender.close();
-			}
+    result[0] = (byte) ((data & 0xFF000000) >> 24);
+    result[1] = (byte) ((data & 0x00FF0000) >> 16);
+    result[2] = (byte) ((data & 0x0000FF00) >> 8);
+    result[3] = (byte) ((data & 0x000000FF) >> 0);
 
-			if (serverThread != null) {
-				serverThread.close();
-			}
+    return result;
+  }
 
-			if (serverSocket != null) {
-				serverSocket.close();
-			}
-			if (objectOutputStream != null) {
-				trySendingCloseToOtherNode();
-				objectOutputStream.close();
-			}
+  private InetSocketAddress waitForPing(final byte[] serverPortBA) {
+    try (MulticastSocket socket = new MulticastSocket(Cluster.MULTICAST_PORT)) {
+      System.out.println(GROUP.getHostAddress());
+      socket.joinGroup(GROUP);
 
-			if (clientSocket != null) {
-				clientSocket.close();
-			}
-		}
-	}
+      InetSocketAddress remoteSocketAddress = null;
+      while (remoteSocketAddress == null) {
+        byte[] buf = new byte[Integer.BYTES];
+        DatagramPacket packet = new DatagramPacket(buf, buf.length);
+        socket.receive(packet);
 
-	public Cluster connect() throws IOException {
-		this.serverSocket = new ServerSocket(0);
-
-		int serverPort = serverSocket.getLocalPort();
-		byte[] serverPortBA = convertIntToByteArray(serverPort);
-		this.pingSender = new PingSender(GROUP, serverPortBA, failureListener);
-
-		this.serverThread = new ServerThread(serverSocket, objectReceiver, failureListener, pingSender);
-		this.serverThread.start();
-
-		new Thread(pingSender).start();
-
-		InetSocketAddress remoteSocketAddress = waitForPing(serverPortBA);
-
-		clientSocket = new Socket(remoteSocketAddress.getAddress(), remoteSocketAddress.getPort());
-
-		objectOutputStream = new ObjectOutputStream(clientSocket.getOutputStream());
-		return this;
-	}
-
-	private int convertByteArrayToInt(final byte[] bytes) {
-		return bytes[0] << 24 | (bytes[1] & 0xFF) << 16 | (bytes[2] & 0xFF) << 8 | (bytes[3] & 0xFF);
-	}
-
-	private byte[] convertIntToByteArray(final int data) {
-		byte[] result = new byte[Integer.BYTES];
-
-		result[0] = (byte) ((data & 0xFF000000) >> 24);
-		result[1] = (byte) ((data & 0x00FF0000) >> 16);
-		result[2] = (byte) ((data & 0x0000FF00) >> 8);
-		result[3] = (byte) ((data & 0x000000FF) >> 0);
-
-		return result;
-	}
-
-	public synchronized void send(final Object object) throws IOException {
-		objectOutputStream.writeObject(object);
-		objectOutputStream.flush();
-	}
-
-	private void trySendingCloseToOtherNode() {
-		try {
-			send(ClusterClose.INSTANCE);
-		} catch (IOException e) {
-			// We do not care if there is an exception on the channel at this
-			// point
-		}
-	}
-
-	private InetSocketAddress waitForPing(final byte[] serverPortBA) {
-		try (MulticastSocket socket = new MulticastSocket(Cluster.MULTICAST_PORT)) {
-			System.out.println(GROUP.getHostAddress());
-			socket.joinGroup(GROUP);
-
-			InetSocketAddress remoteSocketAddress = null;
-			while (!closed.get() && remoteSocketAddress == null) {
-				byte[] buf = new byte[Integer.BYTES];
-				DatagramPacket packet = new DatagramPacket(buf, buf.length);
-				socket.receive(packet);
-
-				if (!Arrays.equals(buf, serverPortBA)) {
-					int remotePort = convertByteArrayToInt(buf);
-					remoteSocketAddress = new InetSocketAddress(packet.getAddress(), remotePort);
-				}
-			}
-			socket.leaveGroup(GROUP);
-			return remoteSocketAddress;
-		} catch (IOException e) {
-			throw new UncheckedIOException(e);
-		}
-	}
+        if (!Arrays.equals(buf, serverPortBA)) {
+          int remotePort = convertByteArrayToInt(buf);
+          remoteSocketAddress = new InetSocketAddress(packet.getAddress(), remotePort);
+        }
+      }
+      socket.leaveGroup(GROUP);
+      return remoteSocketAddress;
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
 }
